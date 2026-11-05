@@ -1,0 +1,49 @@
+--- a/video/out/vo_avfoundation.m	2026-11-03 13:20:24
++++ b/video/out/vo_avfoundation.m	2026-11-03 13:20:24
+@@ -584,6 +584,8 @@
+         dispatch_async(dispatch_get_main_queue(), ^{
+             [CATransaction begin];
+             [CATransaction setDisableActions:YES];
++            // The layer is created before the player rotates, so follow the display layer every update.
++            p->osdLayer.frame = p->displayLayer.bounds;
+             p->osdLayer.contents = (__bridge id)subtitleImage;
+             CGImageRelease(subtitleImage);
+             [CATransaction commit];
+@@ -611,12 +613,10 @@
+         w = vo->params ? vo->params->w : 0;
+         h = vo->params ? vo->params->h : 0;
+     } else {
+-        // Non-composite: prefer current display layer pixel size for overlay sharpness
++        // Non-composite: render at the display layer size in screen pixels for overlay sharpness
+         if (p->displayLayer) {
+             CGRect bounds = p->displayLayer.bounds; // points
+-            CGFloat cs = 1.0;
+-            if ([p->displayLayer respondsToSelector:@selector(contentsScale)])
+-                cs = p->displayLayer.contentsScale;
++            CGFloat cs = p->osdLayer ? p->osdLayer.contentsScale : 1.0;
+             w = (int)MPMAX(1.0, bounds.size.width * cs);
+             h = (int)MPMAX(1.0, bounds.size.height * cs);
+         }
+@@ -644,6 +644,22 @@
+         .h = render_h,
+         .display_par = 1.0,
+     };
++
++    // The overlay covers the whole layer, so tell libass where the fitted picture sits.
++    if (!p->composite_osd && vo->params && p->displayLayer &&
++        [p->displayLayer.videoGravity isEqualToString:AVLayerVideoGravityResizeAspect]) {
++        int dw = 0, dh = 0;
++        mp_image_params_get_dsize(vo->params, &dw, &dh);
++        if (dw > 0 && dh > 0) {
++            double scale = MPMIN((double)render_w / dw, (double)render_h / dh);
++            int vw = (int)lrint(dw * scale);
++            int vh = (int)lrint(dh * scale);
++            osd_res.ml = (render_w - vw) / 2;
++            osd_res.mr = render_w - vw - osd_res.ml;
++            osd_res.mt = (render_h - vh) / 2;
++            osd_res.mb = render_h - vh - osd_res.mt;
++        }
++    }
+     
+     static const bool formats[SUBBITMAP_COUNT] = {
+         [SUBBITMAP_BGRA] = true,

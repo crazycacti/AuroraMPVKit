@@ -1,0 +1,5 @@
+framework module MPVKit {
+    umbrella header "MPVKit.h"
+    export *
+    module * { export * }
+}

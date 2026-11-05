@@ -1,0 +1,5 @@
+.build/
+.swiftpm/
+work/
+.DS_Store
+work-tvos/

@@ -1,0 +1,50 @@
+--- a/video/out/vo_avfoundation.m	2026-11-03 12:45:59
++++ b/video/out/vo_avfoundation.m	2026-11-03 12:45:59
+@@ -199,6 +199,31 @@
+     }
+ }
+ 
++// Tell the display layer the shape of one pixel so anamorphic sources keep their display aspect.
++static void set_pixel_aspect(CVPixelBufferRef buf, const struct mp_image *mpi)
++{
++    int p_w = mpi->params.p_w;
++    int p_h = mpi->params.p_h;
++    if (!buf || p_w <= 0 || p_h <= 0 || p_w == p_h)
++        return;
++
++    CFNumberRef h = CFNumberCreate(NULL, kCFNumberIntType, &p_w);
++    CFNumberRef v = CFNumberCreate(NULL, kCFNumberIntType, &p_h);
++    const void *keys[] = {kCVImageBufferPixelAspectRatioHorizontalSpacingKey,
++                          kCVImageBufferPixelAspectRatioVerticalSpacingKey};
++    const void *values[] = {h, v};
++    CFDictionaryRef par = CFDictionaryCreate(NULL, keys, values, 2,
++                                             &kCFTypeDictionaryKeyCallBacks,
++                                             &kCFTypeDictionaryValueCallBacks);
++    CFRelease(h);
++    CFRelease(v);
++    if (par) {
++        CVBufferSetAttachment(buf, kCVImageBufferPixelAspectRatioKey, par,
++                              kCVAttachmentMode_ShouldPropagate);
++        CFRelease(par);
++    }
++}
++
+ // Map mpv image format to CVPixelBuffer format
+ static OSType get_cv_pixel_format(int imgfmt)
+ {
+@@ -1012,6 +1037,7 @@
+ 
+         CMSampleBufferRef buf = NULL;
+         CMFormatDescriptionRef format = NULL;
++        set_pixel_aspect(finalBuffer, mpi);
+         OSStatus err = CMVideoFormatDescriptionCreateForImageBuffer(NULL, finalBuffer, &format);
+         if (err != noErr || !format) {
+             MP_ERR(vo, "Failed to create format description: %d\n", (int)err);
+@@ -1226,6 +1252,7 @@
+ 
+                     CMFormatDescriptionRef format = NULL;
+                     CMSampleBufferRef buf = NULL;
++                    set_pixel_aspect(composited, p->next_image);
+                     OSStatus err = CMVideoFormatDescriptionCreateForImageBuffer(NULL, composited, &format);
+                     if (err == noErr && format) {
+                         err = CMSampleBufferCreateReadyWithImageBuffer(NULL, composited, format, &info, &buf);
