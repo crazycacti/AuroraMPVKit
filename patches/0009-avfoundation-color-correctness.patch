@@ -8,25 +8,21 @@
  #import <TargetConditionals.h>
  
  #if TARGET_OS_IPHONE
-@@ -88,6 +89,10 @@
+@@ -88,6 +89,8 @@
      
      // Display resolution for scaling subtitles (0 = no upscaling)
      int display_height;
 +
-+    // PQ/HLG once seen for this file. SDR stays unknown and is not converted
-+    // when a frame has nothing to draw, so HDR mode does not toggle with subs.
 +    enum pl_color_transfer hdr_transfer;
  };
  
  // Helper to sync OSD layer frame with display layer bounds
-@@ -180,23 +185,265 @@
+@@ -180,23 +183,263 @@
          &p->output_pool_h, NULL, w, h, outputFormat, "composite output");
  }
  
 -// Copy HDR metadata from source to destination pixel buffer
 -static void copy_hdr_metadata(CVPixelBufferRef src, CVPixelBufferRef dst)
-+// Mapped Dolby Vision tags describe the reshaped output. This vo does not
-+// reshape, so use the pre-mapping values that match the pixels.
 +static bool pixel_is_dovi(const struct mp_image_params *par)
 +{
 +    return par->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION;
@@ -68,7 +64,7 @@
 +    case PL_COLOR_SYSTEM_SMPTE_240M: return kCVImageBufferYCbCrMatrix_SMPTE_240M_1995;
 +    case PL_COLOR_SYSTEM_BT_2020_NC:
 +    case PL_COLOR_SYSTEM_BT_2020_C: return kCVImageBufferYCbCrMatrix_ITU_R_2020;
-+    default: return NULL; // ICtCp and Dolby Vision are not YCbCr
++    default: return NULL;
 +    }
 +}
 +
@@ -299,13 +295,11 @@
  }
  
  // Tell the display layer the shape of one pixel so anamorphic sources keep their display aspect.
-@@ -224,16 +471,20 @@
-     }
+@@ -225,15 +468,19 @@
  }
  
--// Map mpv image format to CVPixelBuffer format
+ // Map mpv image format to CVPixelBuffer format
 -static OSType get_cv_pixel_format(int imgfmt)
-+// Map mpv image format to CVPixelBuffer format. Range is the pixel format.
 +static OSType get_cv_pixel_format(const struct mp_image *mpi)
  {
 -    switch (imgfmt) {
@@ -326,7 +320,7 @@
          default:
              return 0;
      }
-@@ -252,7 +503,7 @@
+@@ -252,7 +499,7 @@
  {
      struct priv *p = vo->priv;
      
@@ -335,7 +329,7 @@
      if (!cvFormat) {
          MP_ERR(vo, "Unsupported software format: %d\n", mpi->imgfmt);
          return NULL;
-@@ -322,7 +573,7 @@
+@@ -322,7 +569,7 @@
      }
      
      CVPixelBufferUnlockBaseAddress(pixbuf, 0);
@@ -344,14 +338,13 @@
      return pixbuf;
  }
  
-@@ -696,12 +947,19 @@
+@@ -696,12 +943,16 @@
      }
  }
  
 -// Composite subtitle onto video frame using Core Image (GPU) - HDR compatible
 -static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuffer)
 +// Composite subtitle onto video frame using Core Image (GPU) - HDR compatible.
-+// Returns NULL when the caller should enqueue the source buffer unchanged.
 +static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuffer,
 +                                        const struct mp_image *mpi)
  {
@@ -362,13 +355,11 @@
 +    note_hdr_output(p, mpi, videoBuffer);
 +    bool draw = p->cachedSubtitleImage && p->has_subtitle &&
 +                p->cachedSubtitleCIImage && p->osd_w > 0 && p->osd_h > 0;
-+    // SDR with nothing to draw keeps the decoder buffer. PQ/HLG stays on
-+    // half-float for the rest of the file.
 +    if (!draw && !transfer_is_pq_hlg(p->hdr_transfer))
          return NULL;
      
      size_t videoW = CVPixelBufferGetWidth(videoBuffer);
-@@ -729,37 +987,42 @@
+@@ -729,37 +980,42 @@
          return NULL;
      }
      
@@ -434,7 +425,7 @@
          // Scale video to output dimensions if upscaling
          if (outW != videoW || outH != videoH) {
              CGFloat scaleX = (CGFloat)outW / (CGFloat)videoW;
-@@ -767,52 +1030,32 @@
+@@ -767,52 +1023,32 @@
              videoImage = [videoImage imageByApplyingTransform:
                  CGAffineTransformMakeScale(scaleX, scaleY)];
          }
@@ -512,13 +503,12 @@
      return outputBuffer;
  }
  
-@@ -838,10 +1081,13 @@
+@@ -838,10 +1074,12 @@
              return -1;
          }
          
 -        // Use extended linear Display P3 color space for HDR compositing
 -        // This color space can represent values > 1.0 needed for HDR
-+        // Extended linear BT.2020 holds BT.709 and BT.2020 without clipping.
          CGColorSpaceRef workingColorSpace = CGColorSpaceCreateWithName(
 -            kCGColorSpaceExtendedLinearDisplayP3);
 +            kCGColorSpaceExtendedLinearITUR_2020);
@@ -529,7 +519,7 @@
          if (!workingColorSpace) {
              workingColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceExtendedSRGB);
          }
-@@ -986,61 +1232,16 @@
+@@ -986,61 +1224,16 @@
          CVPixelBufferRef finalBuffer = pixbuf;
          bool needsRelease = false;
  
@@ -592,7 +582,7 @@
          // Create and enqueue sample buffer
          CMTimebaseRef timebase = [p->displayLayer controlTimebase];
          CMTime presentationTime = timebase ? CMTimebaseGetTime(timebase) : kCMTimeInvalid;
-@@ -1154,6 +1355,7 @@
+@@ -1154,6 +1347,7 @@
      struct priv *p = vo->priv;
      
      MP_VERBOSE(vo, "reconfig: %dx%d\n", params->w, params->h);
@@ -600,7 +590,7 @@
      
      // Flush the display layer when video configuration changes
      // This is critical for PiP: when a new video starts (e.g., autoplay), the old
-@@ -1256,7 +1458,7 @@
+@@ -1256,7 +1450,7 @@
              }
  
              if (pixbuf) {
