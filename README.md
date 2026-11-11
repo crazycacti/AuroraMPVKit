@@ -35,9 +35,11 @@ The work directory defaults to `work/`. The script:
 
 1. Clones streamyfin/MPVKit at tag `0.41.0-av5`.
 2. Removes `--enable-nonfree` from the FFmpeg configure flags and drops `libsmbclient` from the combined framework.
-3. Copies `patches/0007-avfoundation-pixel-aspect-ratio.patch` and `patches/0008-avfoundation-subtitle-layer-layout.patch` into the upstream libmpv patch folder.
+3. Copies every patch in `patches/` into the upstream libmpv patch folder. The build applies that folder in sorted order, so `0007`, `0008`, and `0009` land on top of upstream `0004`.
 4. Runs the upstream build for `ios` and `isimulator`, then `scripts/link.sh` to link the static libraries into one dynamic framework.
 5. Replaces `MPVKit.xcframework` in the repo.
+
+`patches/0009-avfoundation-color-correctness.patch` tags avfoundation frames before they are enqueued. A hardware-decoded SDR frame is left unchanged when that frame has nothing to composite. Once a file is PQ or HLG, frames stay on a half-float buffer tagged BT.2020 PQ or HLG for the rest of the file, including frames with no subtitles. Software-decoded frames are tagged from the image color parameters. Dolby Vision profile 5 is not reshaped to HDR10 in this output.
 
 To relink an existing build without rebuilding:
 

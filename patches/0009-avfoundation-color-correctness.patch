@@ -1,0 +1,601 @@
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -39,6 +39,7 @@
+ #import <QuartzCore/QuartzCore.h>
+ #import <Metal/Metal.h>
+ #import <CoreVideo/CoreVideo.h>
++#import <CoreFoundation/CFByteOrder.h>
+ #import <TargetConditionals.h>
+ 
+ #if TARGET_OS_IPHONE
+@@ -88,6 +89,8 @@
+     
+     // Display resolution for scaling subtitles (0 = no upscaling)
+     int display_height;
++
++    enum pl_color_transfer hdr_transfer;
+ };
+ 
+ // Helper to sync OSD layer frame with display layer bounds
+@@ -180,23 +183,263 @@
+         &p->output_pool_h, NULL, w, h, outputFormat, "composite output");
+ }
+ 
+-// Copy HDR metadata from source to destination pixel buffer
+-static void copy_hdr_metadata(CVPixelBufferRef src, CVPixelBufferRef dst)
++static bool pixel_is_dovi(const struct mp_image_params *par)
++{
++    return par->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION;
++}
++
++static enum pl_color_system pixel_system(const struct mp_image_params *par)
++{
++    return pixel_is_dovi(par) ? par->sys_orig : par->repr.sys;
++}
++
++static enum pl_color_primaries pixel_primaries(const struct mp_image_params *par)
++{
++    return pixel_is_dovi(par) ? par->primaries_orig : par->color.primaries;
++}
++
++static enum pl_color_transfer pixel_transfer(const struct mp_image_params *par)
++{
++    return pixel_is_dovi(par) ? par->transfer_orig : par->color.transfer;
++}
++
++static bool transfer_is_pq_hlg(enum pl_color_transfer trc)
++{
++    return trc == PL_COLOR_TRC_PQ || trc == PL_COLOR_TRC_HLG;
++}
++
++static void set_attachment(CVPixelBufferRef buf, CFStringRef key, CFTypeRef value)
++{
++    if (value)
++        CVBufferSetAttachment(buf, key, value, kCVAttachmentMode_ShouldPropagate);
++    else
++        CVBufferRemoveAttachment(buf, key);
++}
++
++static CFStringRef matrix_tag(enum pl_color_system sys)
++{
++    switch (sys) {
++    case PL_COLOR_SYSTEM_BT_601: return kCVImageBufferYCbCrMatrix_ITU_R_601_4;
++    case PL_COLOR_SYSTEM_BT_709: return kCVImageBufferYCbCrMatrix_ITU_R_709_2;
++    case PL_COLOR_SYSTEM_SMPTE_240M: return kCVImageBufferYCbCrMatrix_SMPTE_240M_1995;
++    case PL_COLOR_SYSTEM_BT_2020_NC:
++    case PL_COLOR_SYSTEM_BT_2020_C: return kCVImageBufferYCbCrMatrix_ITU_R_2020;
++    default: return NULL;
++    }
++}
++
++static CFStringRef primaries_tag(enum pl_color_primaries prim)
++{
++    switch (prim) {
++    case PL_COLOR_PRIM_BT_709: return kCVImageBufferColorPrimaries_ITU_R_709_2;
++    case PL_COLOR_PRIM_BT_2020: return kCVImageBufferColorPrimaries_ITU_R_2020;
++    case PL_COLOR_PRIM_BT_601_525: return kCVImageBufferColorPrimaries_SMPTE_C;
++    case PL_COLOR_PRIM_BT_601_625: return kCVImageBufferColorPrimaries_EBU_3213;
++    case PL_COLOR_PRIM_DISPLAY_P3: return kCVImageBufferColorPrimaries_P3_D65;
++    case PL_COLOR_PRIM_DCI_P3: return kCVImageBufferColorPrimaries_DCI_P3;
++    default: return NULL;
++    }
++}
++
++static CFStringRef transfer_tag(enum pl_color_transfer trc, float *gamma)
++{
++    *gamma = 0;
++    switch (trc) {
++    case PL_COLOR_TRC_BT_1886: return kCVImageBufferTransferFunction_ITU_R_709_2;
++    case PL_COLOR_TRC_SRGB: return kCVImageBufferTransferFunction_sRGB;
++    case PL_COLOR_TRC_PQ: return kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ;
++    case PL_COLOR_TRC_HLG: return kCVImageBufferTransferFunction_ITU_R_2100_HLG;
++    case PL_COLOR_TRC_LINEAR: return kCVImageBufferTransferFunction_Linear;
++    case PL_COLOR_TRC_ST428: return kCVImageBufferTransferFunction_SMPTE_ST_428_1;
++    case PL_COLOR_TRC_GAMMA22: *gamma = 2.2f; return kCVImageBufferTransferFunction_UseGamma;
++    case PL_COLOR_TRC_GAMMA28: *gamma = 2.8f; return kCVImageBufferTransferFunction_UseGamma;
++    default: return NULL;
++    }
++}
++
++static CGColorSpaceRef colorspace_for_transfer(enum pl_color_transfer trc)
++{
++    CFStringRef name = kCGColorSpaceITUR_709;
++    if (trc == PL_COLOR_TRC_PQ)
++        name = kCGColorSpaceITUR_2020_PQ;
++    else if (trc == PL_COLOR_TRC_HLG)
++        name = kCGColorSpaceITUR_2020_HLG;
++    else if (trc == PL_COLOR_TRC_SRGB)
++        name = kCGColorSpaceSRGB;
++    return CGColorSpaceCreateWithName(name);
++}
++
++static void rgb_tags_for_transfer(enum pl_color_transfer trc,
++                                  CFStringRef *prim, CFStringRef *transfer)
++{
++    float unused = 0;
++    enum pl_color_transfer tag = trc;
++    if (trc != PL_COLOR_TRC_PQ && trc != PL_COLOR_TRC_HLG && trc != PL_COLOR_TRC_SRGB)
++        tag = PL_COLOR_TRC_BT_1886;
++    *transfer = transfer_tag(tag, &unused);
++    *prim = transfer_is_pq_hlg(trc) ? kCVImageBufferColorPrimaries_ITU_R_2020
++                                    : kCVImageBufferColorPrimaries_ITU_R_709_2;
++}
++
++static CGColorSpaceRef buffer_color_space(CVPixelBufferRef buf)
++{
++    CGColorSpaceRef attached = (CGColorSpaceRef)CVBufferGetAttachment(
++        buf, kCVImageBufferCGColorSpaceKey, NULL);
++    if (attached)
++        return CGColorSpaceRetain(attached);
++
++    CFDictionaryRef attachments = CVBufferCopyAttachments(
++        buf, kCVAttachmentMode_ShouldPropagate);
++    if (!attachments)
++        return NULL;
++    CGColorSpaceRef created = CVImageBufferCreateColorSpaceFromAttachments(attachments);
++    CFRelease(attachments);
++    return created;
++}
++
++static enum pl_color_transfer buffer_pq_hlg(CVPixelBufferRef buf)
++{
++    CFStringRef trc = CVBufferGetAttachment(buf, kCVImageBufferTransferFunctionKey, NULL);
++    if (!trc)
++        return PL_COLOR_TRC_UNKNOWN;
++    if (CFEqual(trc, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ))
++        return PL_COLOR_TRC_PQ;
++    if (CFEqual(trc, kCVImageBufferTransferFunction_ITU_R_2100_HLG))
++        return PL_COLOR_TRC_HLG;
++    return PL_COLOR_TRC_UNKNOWN;
++}
++
++static void note_hdr_output(struct priv *p, const struct mp_image *mpi,
++                            CVPixelBufferRef buf)
++{
++    if (transfer_is_pq_hlg(p->hdr_transfer))
++        return;
++    enum pl_color_transfer trc = pixel_transfer(&mpi->params);
++    if (!transfer_is_pq_hlg(trc))
++        trc = buffer_pq_hlg(buf);
++    if (transfer_is_pq_hlg(trc))
++        p->hdr_transfer = trc;
++}
++
++// ISO/IEC 23008-2 mastering display (D.2.28) and content light level (D.2.35),
++// big-endian. xy is 16-bit 0.16; luminance is in 0.0001 cd/m2 units.
++static uint16_t xy_be(float v)
++{
++    if (!(v > 0.f))
++        return 0;
++    if (v > 1.f)
++        v = 1.f;
++    return CFSwapInt16HostToBig((uint16_t)(v * 50000.f + 0.5f));
++}
++
++static uint32_t nits_be(float nits)
++{
++    if (!(nits > 0.f))
++        return 0;
++    double scaled = (double)nits * 10000.0;
++    if (scaled > 4294967295.0)
++        scaled = 4294967295.0;
++    return CFSwapInt32HostToBig((uint32_t)(scaled + 0.5));
++}
++
++static CFDataRef mastering_data(const struct pl_hdr_metadata *hdr)
+ {
+-    const CFStringRef keys[] = {
+-        kCVImageBufferTransferFunctionKey,      // PQ for HDR10/DolbyVision, HLG for HLG
+-        kCVImageBufferColorPrimariesKey,        // BT.2020 for HDR
+-        kCVImageBufferYCbCrMatrixKey,
+-        kCVImageBufferMasteringDisplayColorVolumeKey,  // HDR10 static metadata
+-        kCVImageBufferContentLightLevelInfoKey,        // MaxCLL, MaxFALL
++    const struct pl_raw_primaries *prim = &hdr->prim;
++    if (!(prim->red.x > 0.f && prim->green.y > 0.f && prim->blue.y > 0.f &&
++          prim->white.x > 0.f && hdr->max_luma > 0.f))
++        return NULL;
++
++    uint16_t xy[8] = {
++        xy_be(prim->green.x), xy_be(prim->green.y),
++        xy_be(prim->blue.x), xy_be(prim->blue.y),
++        xy_be(prim->red.x), xy_be(prim->red.y),
++        xy_be(prim->white.x), xy_be(prim->white.y),
+     };
+-    
+-    for (size_t i = 0; i < MP_ARRAY_SIZE(keys); i++) {
+-        CFTypeRef value = CVBufferGetAttachment(src, keys[i], NULL);
+-        if (value) {
+-            CVBufferSetAttachment(dst, keys[i], value, kCVAttachmentMode_ShouldPropagate);
+-        }
++    uint32_t luma[2] = { nits_be(hdr->max_luma), nits_be(hdr->min_luma) };
++    uint8_t raw[24];
++    memcpy(raw, xy, sizeof(xy));
++    memcpy(raw + 16, luma, sizeof(luma));
++    return CFDataCreate(NULL, (const UInt8 *)raw, sizeof(raw));
++}
++
++static CFDataRef content_light_data(const struct pl_hdr_metadata *hdr)
++{
++    if (!(hdr->max_cll > 0.f || hdr->max_fall > 0.f))
++        return NULL;
++    float cll = hdr->max_cll > 65535.f ? 65535.f : hdr->max_cll;
++    float fall = hdr->max_fall > 65535.f ? 65535.f : hdr->max_fall;
++    uint16_t v[2] = {
++        CFSwapInt16HostToBig((uint16_t)(cll > 0.f ? cll + 0.5f : 0)),
++        CFSwapInt16HostToBig((uint16_t)(fall > 0.f ? fall + 0.5f : 0)),
++    };
++    return CFDataCreate(NULL, (const UInt8 *)v, sizeof(v));
++}
++
++static void attach_hdr_side_data(CVPixelBufferRef dst, CVPixelBufferRef src,
++                                 const struct mp_image *mpi, bool hdr)
++{
++    CFTypeRef mdcv = src ? CVBufferGetAttachment(
++        src, kCVImageBufferMasteringDisplayColorVolumeKey, NULL) : NULL;
++    CFDataRef made_mdcv = NULL;
++    if (!mdcv && hdr && mpi) {
++        made_mdcv = mastering_data(&mpi->params.color.hdr);
++        mdcv = made_mdcv;
++    }
++    set_attachment(dst, kCVImageBufferMasteringDisplayColorVolumeKey, mdcv);
++    if (made_mdcv)
++        CFRelease(made_mdcv);
++
++    CFTypeRef cll = src ? CVBufferGetAttachment(
++        src, kCVImageBufferContentLightLevelInfoKey, NULL) : NULL;
++    CFDataRef made_cll = NULL;
++    if (!cll && hdr && mpi) {
++        made_cll = content_light_data(&mpi->params.color.hdr);
++        cll = made_cll;
++    }
++    set_attachment(dst, kCVImageBufferContentLightLevelInfoKey, cll);
++    if (made_cll)
++        CFRelease(made_cll);
++}
++
++static void tag_rgb_output(CVPixelBufferRef dst, CVPixelBufferRef src,
++                           const struct mp_image *mpi, enum pl_color_transfer dest,
++                           CGColorSpaceRef space)
++{
++    CFStringRef prim = NULL, transfer = NULL;
++    rgb_tags_for_transfer(dest, &prim, &transfer);
++    // Half-float output is RGB. A YCbCr matrix on it makes the display treat
++    // the samples as video-range YUV.
++    CVBufferRemoveAttachment(dst, kCVImageBufferYCbCrMatrixKey);
++    CVBufferRemoveAttachment(dst, kCVImageBufferGammaLevelKey);
++    set_attachment(dst, kCVImageBufferColorPrimariesKey, prim);
++    set_attachment(dst, kCVImageBufferTransferFunctionKey, transfer);
++    set_attachment(dst, kCVImageBufferCGColorSpaceKey, space);
++    attach_hdr_side_data(dst, src, mpi, transfer_is_pq_hlg(dest));
++}
++
++static void tag_software_buffer(CVPixelBufferRef buf, const struct mp_image *mpi)
++{
++    float gamma = 0;
++    const struct mp_image_params *par = &mpi->params;
++    set_attachment(buf, kCVImageBufferYCbCrMatrixKey, matrix_tag(pixel_system(par)));
++    set_attachment(buf, kCVImageBufferColorPrimariesKey, primaries_tag(pixel_primaries(par)));
++    set_attachment(buf, kCVImageBufferTransferFunctionKey,
++                   transfer_tag(pixel_transfer(par), &gamma));
++    if (gamma != 0) {
++        CFNumberRef level = CFNumberCreate(NULL, kCFNumberFloat32Type, &gamma);
++        set_attachment(buf, kCVImageBufferGammaLevelKey, level);
++        CFRelease(level);
++    } else {
++        set_attachment(buf, kCVImageBufferGammaLevelKey, NULL);
+     }
++
++    // Drop a recycled color space so the new tags are what get rebuilt.
++    set_attachment(buf, kCVImageBufferCGColorSpaceKey, NULL);
++    CGColorSpaceRef space = buffer_color_space(buf);
++    set_attachment(buf, kCVImageBufferCGColorSpaceKey, space);
++    if (space)
++        CGColorSpaceRelease(space);
++    attach_hdr_side_data(buf, NULL, mpi, transfer_is_pq_hlg(pixel_transfer(par)));
+ }
+ 
+ // Tell the display layer the shape of one pixel so anamorphic sources keep their display aspect.
+@@ -225,15 +468,19 @@
+ }
+ 
+ // Map mpv image format to CVPixelBuffer format
+-static OSType get_cv_pixel_format(int imgfmt)
++static OSType get_cv_pixel_format(const struct mp_image *mpi)
+ {
+-    switch (imgfmt) {
++    bool full = mpi->params.repr.levels == PL_COLOR_LEVELS_FULL;
++    switch (mpi->imgfmt) {
+         case IMGFMT_NV12:
+-            return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
++            return full ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
++                        : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+         case IMGFMT_420P:
+-            return kCVPixelFormatType_420YpCbCr8Planar;
++            return full ? kCVPixelFormatType_420YpCbCr8PlanarFullRange
++                        : kCVPixelFormatType_420YpCbCr8Planar;
+         case IMGFMT_P010:
+-            return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
++            return full ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
++                        : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
+         default:
+             return 0;
+     }
+@@ -252,7 +499,7 @@
+ {
+     struct priv *p = vo->priv;
+     
+-    OSType cvFormat = get_cv_pixel_format(mpi->imgfmt);
++    OSType cvFormat = get_cv_pixel_format(mpi);
+     if (!cvFormat) {
+         MP_ERR(vo, "Unsupported software format: %d\n", mpi->imgfmt);
+         return NULL;
+@@ -322,7 +569,7 @@
+     }
+     
+     CVPixelBufferUnlockBaseAddress(pixbuf, 0);
+-    
++    tag_software_buffer(pixbuf, mpi);
+     return pixbuf;
+ }
+ 
+@@ -696,12 +943,16 @@
+     }
+ }
+ 
+-// Composite subtitle onto video frame using Core Image (GPU) - HDR compatible
+-static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuffer)
++// Composite subtitle onto video frame using Core Image (GPU) - HDR compatible.
++static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuffer,
++                                        const struct mp_image *mpi)
+ {
+     struct priv *p = vo->priv;
+-    
+-    if (!p->cachedSubtitleImage || !p->has_subtitle)
++
++    note_hdr_output(p, mpi, videoBuffer);
++    bool draw = p->cachedSubtitleImage && p->has_subtitle &&
++                p->cachedSubtitleCIImage && p->osd_w > 0 && p->osd_h > 0;
++    if (!draw && !transfer_is_pq_hlg(p->hdr_transfer))
+         return NULL;
+     
+     size_t videoW = CVPixelBufferGetWidth(videoBuffer);
+@@ -729,37 +980,42 @@
+         return NULL;
+     }
+     
+-    // Copy HDR metadata from input to output buffer BEFORE rendering
+-    copy_hdr_metadata(videoBuffer, outputBuffer);
+-    
++    enum pl_color_transfer dest = transfer_is_pq_hlg(p->hdr_transfer)
++        ? p->hdr_transfer
++        : (pixel_transfer(&mpi->params) == PL_COLOR_TRC_SRGB
++               ? PL_COLOR_TRC_SRGB : PL_COLOR_TRC_BT_1886);
++    CGColorSpaceRef dstSpace = colorspace_for_transfer(dest);
++    if (!dstSpace) {
++        MP_ERR(vo, "Failed to create output color space\n");
++        CVPixelBufferRelease(outputBuffer);
++        return NULL;
++    }
++    tag_rgb_output(outputBuffer, videoBuffer, mpi, dest, dstSpace);
++
+     // Use autoreleasepool to ensure CIImage objects are released promptly
+     @autoreleasepool {
+-        // Create CIImages - preserve color space from source for HDR
+-        CGColorSpaceRef srcColorSpace = CVImageBufferGetColorSpace(videoBuffer);
+-        CGColorSpaceRef fallbackColorSpace = NULL;
++        CGColorSpaceRef srcColorSpace = buffer_color_space(videoBuffer);
+         if (!srcColorSpace) {
+-            fallbackColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+-            srcColorSpace = fallbackColorSpace;
++            enum pl_color_transfer src_trc = pixel_transfer(&mpi->params);
++            if (src_trc != PL_COLOR_TRC_PQ && src_trc != PL_COLOR_TRC_HLG &&
++                src_trc != PL_COLOR_TRC_SRGB && src_trc != PL_COLOR_TRC_BT_1886)
++                src_trc = dest;
++            srcColorSpace = colorspace_for_transfer(src_trc);
+         }
+-        
+-        CIImage *videoImage;
+-        if (srcColorSpace) {
+-            NSDictionary *videoOptions = @{
+-                kCIImageColorSpace: (__bridge id)srcColorSpace
+-            };
+-            videoImage = [CIImage imageWithCVPixelBuffer:videoBuffer options:videoOptions];
+-        } else {
+-            videoImage = [CIImage imageWithCVPixelBuffer:videoBuffer];
+-        }
+-        
+-        if (fallbackColorSpace)
+-            CGColorSpaceRelease(fallbackColorSpace);
+-        
++
++        CIImage *videoImage = srcColorSpace
++            ? [CIImage imageWithCVPixelBuffer:videoBuffer options:@{
++                kCIImageColorSpace: (__bridge id)srcColorSpace}]
++            : [CIImage imageWithCVPixelBuffer:videoBuffer];
++        if (srcColorSpace)
++            CGColorSpaceRelease(srcColorSpace);
++
+         if (!videoImage) {
++            CGColorSpaceRelease(dstSpace);
+             CVPixelBufferRelease(outputBuffer);
+             return NULL;
+         }
+-        
++
+         // Scale video to output dimensions if upscaling
+         if (outW != videoW || outH != videoH) {
+             CGFloat scaleX = (CGFloat)outW / (CGFloat)videoW;
+@@ -767,52 +1023,32 @@
+             videoImage = [videoImage imageByApplyingTransform:
+                 CGAffineTransformMakeScale(scaleX, scaleY)];
+         }
+-        
+-        // Use cached CIImage (manually retained to bypass ARC issues in C struct)
+-        CIImage *subtitleImage = (__bridge CIImage *)p->cachedSubtitleCIImage;
+-        
+-        if (!subtitleImage) {
+-            CVPixelBufferRelease(outputBuffer);
+-            return NULL;
+-        }
+-        
+-        // Position subtitle at correct location using dirty rect bounds
+-        // The subtitle image is only the bounding box region, not full frame
+-        // We need to scale and translate it to the correct position in output
+-        
+-        // Calculate scale factor from OSD resolution to output resolution
+-        CGFloat scaleX = (CGFloat)outW / (CGFloat)p->osd_w;
+-        CGFloat scaleY = (CGFloat)outH / (CGFloat)p->osd_h;
+-        
+-        // Get the bounding box position (in OSD coordinates)
+-        CGFloat boundsX = p->subtitleBounds.origin.x;
+-        CGFloat boundsY = p->subtitleBounds.origin.y;
+-        
+-        // Build transform: first scale the subtitle to output resolution,
+-        // then translate to the correct position
+-        CGAffineTransform transform = CGAffineTransformIdentity;
+-        transform = CGAffineTransformScale(transform, scaleX, scaleY);
+-        transform = CGAffineTransformTranslate(transform, boundsX, boundsY);
+-        
+-        subtitleImage = [subtitleImage imageByApplyingTransform:transform];
+-        
+-        // Composite subtitle over video
+-        CIImage *composited = [subtitleImage imageByCompositingOverImage:videoImage];
+-
+-        // (debug indicator removed)
+-        
+-        // Render to output buffer, preserving color space
+-        CGColorSpaceRef outputColorSpace = CVImageBufferGetColorSpace(videoBuffer);
+-        if (outputColorSpace) {
+-            [p->ciContext render:composited 
+-                 toCVPixelBuffer:outputBuffer 
+-                          bounds:composited.extent
+-                      colorSpace:outputColorSpace];
+-        } else {
+-            [p->ciContext render:composited toCVPixelBuffer:outputBuffer];
+-        }
++
++        CIImage *outputImage = videoImage;
++        if (draw) {
++            // Use cached CIImage (manually retained to bypass ARC issues in C struct)
++            CIImage *subtitleImage = (__bridge CIImage *)p->cachedSubtitleCIImage;
++
++            // Position subtitle at correct location using dirty rect bounds.
++            // The subtitle image is only the bounding box region, not full frame.
++            CGFloat scaleX = (CGFloat)outW / (CGFloat)p->osd_w;
++            CGFloat scaleY = (CGFloat)outH / (CGFloat)p->osd_h;
++            CGFloat boundsX = p->subtitleBounds.origin.x;
++            CGFloat boundsY = p->subtitleBounds.origin.y;
++            CGAffineTransform transform = CGAffineTransformIdentity;
++            transform = CGAffineTransformScale(transform, scaleX, scaleY);
++            transform = CGAffineTransformTranslate(transform, boundsX, boundsY);
++            subtitleImage = [subtitleImage imageByApplyingTransform:transform];
++            outputImage = [subtitleImage imageByCompositingOverImage:videoImage];
++        }
++
++        [p->ciContext render:outputImage
++             toCVPixelBuffer:outputBuffer
++                      bounds:outputImage.extent
++                  colorSpace:dstSpace];
+     }
+-    
++
++    CGColorSpaceRelease(dstSpace);
+     return outputBuffer;
+ }
+ 
+@@ -838,10 +1074,12 @@
+             return -1;
+         }
+         
+-        // Use extended linear Display P3 color space for HDR compositing
+-        // This color space can represent values > 1.0 needed for HDR
+         CGColorSpaceRef workingColorSpace = CGColorSpaceCreateWithName(
+-            kCGColorSpaceExtendedLinearDisplayP3);
++            kCGColorSpaceExtendedLinearITUR_2020);
++        if (!workingColorSpace) {
++            workingColorSpace = CGColorSpaceCreateWithName(
++                kCGColorSpaceExtendedLinearDisplayP3);
++        }
+         if (!workingColorSpace) {
+             workingColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceExtendedSRGB);
+         }
+@@ -986,61 +1224,16 @@
+         CVPixelBufferRef finalBuffer = pixbuf;
+         bool needsRelease = false;
+ 
+-        // In composite mode, always composite to ensure consistent pixel format
+-        // This prevents HDR mode switching when subtitles appear/disappear
+         if (p->composite_osd) {
+             render_osd(vo, pts);
+ 
+-            CVPixelBufferRef composited = composite_frame(vo, pixbuf);
++            CVPixelBufferRef composited = composite_frame(vo, pixbuf, mpi);
+             if (composited) {
+                 finalBuffer = composited;
+                 needsRelease = true;
+-            } else {
+-                // No subtitles to composite, but still convert to consistent format
+-                // This ensures all frames in composite mode use the same pixel format
+-                size_t videoW = CVPixelBufferGetWidth(pixbuf);
+-                size_t videoH = CVPixelBufferGetHeight(pixbuf);
+-                OSType sourceFormat = CVPixelBufferGetPixelFormatType(pixbuf);
+-
+-                if (!create_output_pool(vo, (int)videoW, (int)videoH, sourceFormat)) {
+-                    MP_ERR(vo, "Failed to create output pool for format conversion\n");
+-                    goto error;
+-                }
+-
+-                CVPixelBufferRef convertedBuffer = NULL;
+-                CVReturn status = CVPixelBufferPoolCreatePixelBuffer(
+-                    kCFAllocatorDefault, p->outputPool, &convertedBuffer);
+-
+-                if (status == kCVReturnSuccess && convertedBuffer) {
+-                    copy_hdr_metadata(pixbuf, convertedBuffer);
+-
+-                    @autoreleasepool {
+-                        CGColorSpaceRef srcColorSpace = CVImageBufferGetColorSpace(pixbuf);
+-                        CIImage *videoImage = srcColorSpace ?
+-                            [CIImage imageWithCVPixelBuffer:pixbuf options:@{kCIImageColorSpace: (__bridge id)srcColorSpace}] :
+-                            [CIImage imageWithCVPixelBuffer:pixbuf];
+-
+-                        if (videoImage) {
+-                            CGColorSpaceRef outputColorSpace = CVImageBufferGetColorSpace(pixbuf);
+-                            if (outputColorSpace) {
+-                                [p->ciContext render:videoImage
+-                                     toCVPixelBuffer:convertedBuffer
+-                                              bounds:videoImage.extent
+-                                          colorSpace:outputColorSpace];
+-                            } else {
+-                                [p->ciContext render:videoImage toCVPixelBuffer:convertedBuffer];
+-                            }
+-                            finalBuffer = convertedBuffer;
+-                            needsRelease = true;
+-                        } else {
+-                            CVPixelBufferRelease(convertedBuffer);
+-                        }
+-                    }
+-                }
+             }
+         }
+ 
+-error:
+         // Create and enqueue sample buffer
+         CMTimebaseRef timebase = [p->displayLayer controlTimebase];
+         CMTime presentationTime = timebase ? CMTimebaseGetTime(timebase) : kCMTimeInvalid;
+@@ -1154,6 +1347,7 @@
+     struct priv *p = vo->priv;
+     
+     MP_VERBOSE(vo, "reconfig: %dx%d\n", params->w, params->h);
++    p->hdr_transfer = PL_COLOR_TRC_UNKNOWN;
+     
+     // Flush the display layer when video configuration changes
+     // This is critical for PiP: when a new video starts (e.g., autoplay), the old
+@@ -1256,7 +1450,7 @@
+             }
+ 
+             if (pixbuf) {
+-                CVPixelBufferRef composited = composite_frame(vo, pixbuf);
++                CVPixelBufferRef composited = composite_frame(vo, pixbuf, p->next_image);
+                 if (composited) {
+                     CMTimebaseRef timebase = [p->displayLayer controlTimebase];
+                     CMTime presentationTime = timebase ? CMTimebaseGetTime(timebase) : kCMTimeInvalid;
